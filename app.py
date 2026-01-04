@@ -1,7 +1,6 @@
 import re
 import sys
-import json
-import streamlit as st
+import sympy
 from sympy import (
     symbols, Eq, sympify, E, pi, nsimplify,
     solve as sym_solve,
@@ -10,9 +9,11 @@ from sympy import (
 )
 from sympy.core.traversal import preorder_traversal
 from sympy.solvers.inequalities import solve_univariate_inequality
+import json
+from sympy import fraction
 
 # -------------------------------
-# Safe print (for debugging)
+# Safe print ελληνικών
 # -------------------------------
 def uprint(*objects, sep=' ', end='\n', file=sys.stdout):
     print(*objects, sep=sep, end=end, file=file)
@@ -33,7 +34,7 @@ def format_solution(expr):
 # Normalize input
 # -------------------------------
 def normalize_expr(expr):
-    expr = expr.replace("−", "-").replace("—", "-")
+    expr = expr.replace("—", "-").replace("—", "-")
     expr = expr.replace("^", "**")
     expr = re.sub(r'\bημ\b', 'sin', expr)
     expr = re.sub(r'\bσυν\b', 'cos', expr)
@@ -41,65 +42,102 @@ def normalize_expr(expr):
     expr = re.sub(r'\bσφ\b', 'cot', expr)
     expr = expr.replace("√", "sqrt")
     expr = re.sub(r'\bln\s*\((.*?)\)', r'log(\1, e)', expr)
+    # Add explicit multiplication
     expr = re.sub(r'(\d)([a-zA-Z_])', r'\1*\2', expr)
     expr = re.sub(r'([a-zA-Z_])(\d)', r'\1*\2', expr)
     expr = re.sub(r'\)([a-zA-Z_\d])', r')*\1', expr)
     return expr
 
 # -------------------------------
-# Pretty interval
+# Pretty interval για πεδίο ορισμού
 # -------------------------------
 def pretty_interval(interval):
+    # Αν δεν υπάρχει περιορισμός
+    if interval == Interval(-oo, oo):
+        return "ℝ"
+    
     if isinstance(interval, Interval):
         left = "-∞" if interval.start == -oo else str(interval.start)
         right = "+∞" if interval.end == oo else str(interval.end)
         l_bracket = "(" if interval.left_open else "["
         r_bracket = ")" if interval.right_open else "]"
         return f"{l_bracket}{left}, {right}{r_bracket}"
+    
     if isinstance(interval, Union):
         return " ∪ ".join(pretty_interval(arg) for arg in interval.args)
+    
     return str(interval)
 
 # -------------------------------
-# Domain for expression
+# Πεδίο ορισμού για μία εξίσωση (βελτιωμένο)
 # -------------------------------
 def domain_for_expr(expr, var):
     intervals = []
+
     for sub in preorder_traversal(expr):
+        # Λογάριθμος: arg > 0
         if sub.func == log:
             arg = sub.args[0]
-            ineq = arg > 0
-            if ineq.has(var):
-                sol = solve_univariate_inequality(ineq, var, relational=False)
+            if arg.has(var):
+                sol = solve_univariate_inequality(arg > 0, var, relational=False)
                 intervals.append(sol)
+
+        # Ρίζα: arg >= 0
         if sub.func == sqrt:
             arg = sub.args[0]
-            ineq = arg >= 0
-            if ineq.has(var):
-                sol = solve_univariate_inequality(ineq, var, relational=False)
+            if arg.has(var):
+                sol = solve_univariate_inequality(arg >= 0, var, relational=False)
                 intervals.append(sol)
+
+        # Τριγωνομετρικές: tan -> cos(arg) != 0, cot -> sin(arg) != 0
         if sub.func == tan:
             arg = sub.args[0]
-            ineq = cos(arg) != 0
-            if ineq.has(var):
-                sol = solve_univariate_inequality(ineq, var, relational=False)
+            if arg.has(var):
+                sol = solve_univariate_inequality(cos(arg) != 0, var, relational=False)
                 intervals.append(sol)
         if sub.func == cot:
             arg = sub.args[0]
-            ineq = sin(arg) != 0
-            if ineq.has(var):
-                sol = solve_univariate_inequality(ineq, var, relational=False)
+            if arg.has(var):
+                sol = solve_univariate_inequality(sin(arg) != 0, var, relational=False)
                 intervals.append(sol)
 
+        # Παράνομαστης: expr^-1
+        if sub.is_Pow and sub.exp == -1:
+            denom = sub.base
+            if denom.has(var):
+                simplified_denom = sympy.simplify(denom)
+                if simplified_denom.is_constant():
+                    if simplified_denom == 0:
+                        intervals.append(sympy.EmptySet)
+                else:
+                    sol = solve_univariate_inequality(sympy.Ne(denom, 0), var, relational=False)
+                    intervals.append(sol)
+
+        # Έλεγχος για κλάσματα
+        if sub.func in (sympy.Mul, sympy.Add):
+            num, denom = fraction(sub)
+            if denom.has(var):
+                simplified_denom = sympy.simplify(denom)
+                if simplified_denom.is_constant():
+                    if simplified_denom == 0:
+                        intervals.append(sympy.EmptySet)
+                else:
+                    sol = solve_univariate_inequality(sympy.Ne(denom, 0), var, relational=False)
+                    intervals.append(sol)
+
+    # Αν δεν υπάρχει κανένας περιορισμός
     if not intervals:
         return Interval(-oo, oo)
+
+    # Τομή όλων των περιορισμών
     domain = intervals[0]
     for d in intervals[1:]:
         domain = domain.intersect(d)
+
     return domain
 
 # -------------------------------
-# Solve trig
+# Τριγωνομετρικές λύσεις
 # -------------------------------
 def solve_trig(lhs, rhs, var):
     k = symbols('k', integer=True)
@@ -123,7 +161,7 @@ def solve_trig(lhs, rhs, var):
     return None
 
 # -------------------------------
-# Detect chapters
+# Κατάταξη σε κεφάλαια
 # -------------------------------
 def detect_chapter_sections(user_input):
     with open("theory.json", "r", encoding="utf-8") as f:
@@ -164,7 +202,7 @@ def detect_chapter_sections(user_input):
     return matches
 
 # -------------------------------
-# Solve input
+# Επίλυση εξίσωσης/συστήματος
 # -------------------------------
 def solve_input(user_input):
     exprs = [normalize_expr(e.strip()) for e in user_input.split(",")]
@@ -217,28 +255,24 @@ def solve_input(user_input):
     return formatted_sols, f"{var} ∈ {pretty_interval(domain_final)}"
 
 # -------------------------------
-# Streamlit UI
+# Main
 # -------------------------------
-st.set_page_config(page_title="Greek Math Solver", layout="centered")
-st.title("Επίλυση Εξισώσεων / Συστημάτων")
-st.markdown("Γράψε την εξίσωση ή σύστημα:")
+if __name__ == "__main__":
+    user_input = input("Γράψε την εξίσωση ή σύστημα:\n")
 
-user_input = st.text_input("Εξίσωση ή σύστημα:")
-
-if user_input:
     matches = detect_chapter_sections(user_input)
     solutions, domain = solve_input(user_input)
 
-    st.subheader("Πιθανά κεφάλαια/ενότητες:")
+    uprint("\n Πιθανά κεφάλαια/ενότητες (κατά προτεραιότητα):")
     for chap, sect, score in matches[:3]:
-        st.write(f"- {chap.get('chapter', chap)} / {sect.get('name', sect)} (συμφωνία: {score})")
+        uprint(f"- {chap.get('chapter', chap)} / {sect.get('name', sect)} (συμφωνία: {score})")
 
-    st.subheader("Πεδίο ορισμού:")
-    st.write(domain)
+    uprint("\n Πεδίο ορισμού:")
+    uprint(f"  {domain}")
 
-    st.subheader("Λύσεις:")
+    uprint("\n Λύσεις:")
     if not solutions:
-        st.write("Αδύνατο")
+        uprint("  Αδύνατο")
     else:
         formatted = [{str(k): format_solution(v)} for sol in solutions for k, v in sol.items()]
-        st.write(formatted)
+        uprint(f"  {formatted}")
